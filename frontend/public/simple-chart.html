@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>XAUUSD Live Chart</title>
+    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        body { margin: 0; padding: 20px; font-family: Arial; background: #1e1e1e; color: #fff; }
+        #container { margin-bottom: 10px; }
+        #status { padding: 10px; background: #2a2e39; border-radius: 5px; margin-bottom: 10px; }
+        .connected { color: #26a69a; }
+        .disconnected { color: #ef5350; }
+        #chart { width: 100%; height: 600px; }
+        button { padding: 10px 20px; margin: 5px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <h1>XAUUSD Real-Time Chart</h1>
+        <div id="status">
+            Status: <span id="statusText" class="disconnected">Disconnected</span>
+        </div>
+        <button onclick="connectWS()">Connect</button>
+        <button onclick="disconnectWS()">Disconnect</button>
+    </div>
+    <div id="chart"></div>
+
+    <script>
+        let chart = null;
+        let candlestickSeries = null;
+        let ws = null;
+        let lastBarTime = null; // Track the last bar timestamp we've seen
+
+        // Initialize chart
+        function initChart() {
+            chart = LightweightCharts.createChart(document.getElementById('chart'), {
+                width: document.getElementById('chart').clientWidth,
+                height: 600,
+                layout: {
+                    background: { color: '#1e1e1e' },
+                    textColor: '#d1d4dc',
+                },
+                grid: {
+                    vertLines: { color: '#2a2e39' },
+                    horzLines: { color: '#2a2e39' },
+                },
+                timeScale: {
+                    timeVisible: true,
+                    secondsVisible: true,
+                },
+            });
+
+            candlestickSeries = chart.addSeries(LightweightCharts.CandlestickSeries, {
+                upColor: '#26a69a',
+                downColor: '#ef5350',
+                borderVisible: false,
+                wickUpColor: '#26a69a',
+                wickDownColor: '#ef5350',
+            });
+
+            // Load historical data
+            loadHistoricalData();
+
+            // Handle window resize
+            window.addEventListener('resize', () => {
+                chart.applyOptions({ width: document.getElementById('chart').clientWidth });
+            });
+        }
+
+        async function loadHistoricalData() {
+            try {
+                const response = await fetch('http://localhost:8001/api/chart-data/XAUUSD/1min?limit=100');
+                const data = await response.json();
+
+                if (data.bars && data.bars.length > 0) {
+                    // Filter out any bars in the future (timezone bug workaround)
+                    const now = Math.floor(Date.now() / 1000);
+                    const validBars = data.bars.filter(bar => bar.time <= now + 120); // Allow 2 min buffer
+
+                    console.log('📊 Filtered', data.bars.length, 'bars to', validBars.length, 'valid bars (removed future bars)');
+
+                    if (validBars.length > 0) {
+                        candlestickSeries.setData(validBars);
+                        const lastBar = validBars[validBars.length - 1];
+                        lastBarTime = lastBar.time; // Store the last bar time
+                        console.log('✅ Loaded', validBars.length, 'historical bars');
+                        console.log('📊 Last historical bar time:', lastBar.time, '=', new Date(lastBar.time * 1000).toISOString());
+                    }
+                }
+            } catch (error) {
+                console.error('❌ Error loading historical data:', error);
+            }
+        }
+
+        async function connectWS() {
+            // Don't reset lastBarTime - keep the historical data's last time
+            // This way we'll continue from where historical data left off
+            console.log('🔄 Starting live data stream...');
+
+            // Start streaming service
+            try {
+                await fetch('http://localhost:8001/api/streaming/start', { method: 'POST' });
+                await fetch('http://localhost:8001/api/streaming/subscribe/XAUUSD?exchange=IBMETAL&sec_type=CMDTY&currency=USD&bar_size=5', { method: 'POST' });
+                console.log('✅ Streaming service started');
+            } catch (error) {
+                console.error('❌ Error starting streaming:', error);
+            }
+
+            // Connect WebSocket
+            ws = new WebSocket('ws://localhost:8001/ws/live-data/XAUUSD');
+
+            ws.onopen = () => {
+                document.getElementById('statusText').textContent = 'Connected';
+                document.getElementById('statusText').className = 'connected';
+                console.log('✅ WebSocket connected');
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    console.log('📊 RAW WebSocket data:', data);
+
+                    // Convert ISO timestamp to Unix epoch
+                    const timestamp = Math.floor(new Date(data.timestamp).getTime() / 1000);
+
+                    // Create bar object with PRIMITIVE values
+                    const bar = {
+                        time: timestamp,
+                        open: parseFloat(data.open),
+                        high: parseFloat(data.high),
+                        low: parseFloat(data.low),
+                        close: parseFloat(data.close)
+                    };
+
+                    console.log('📊 Formatted bar:', bar);
+                    console.log('📊 Comparing times - incoming:', bar.time, 'last:', lastBarTime);
+
+                    // Only update if this bar is >= the last bar time
+                    if (lastBarTime === null || bar.time >= lastBarTime) {
+                        candlestickSeries.update(bar);
+                        lastBarTime = bar.time; // Update our tracking
+                        console.log('✅ Chart updated - Close:', bar.close, 'Time:', new Date(bar.time * 1000).toLocaleTimeString());
+                    } else {
+                        console.log('⚠️ Skipping old bar - incoming time', bar.time, 'is older than last bar', lastBarTime);
+                    }
+
+                } catch (error) {
+                    console.error('❌ Update error:', error);
+                    console.error('Error details:', error.message, error.stack);
+                }
+            };
+
+            ws.onerror = (error) => {
+                console.error('❌ WebSocket error:', error);
+            };
+
+            ws.onclose = () => {
+                document.getElementById('statusText').textContent = 'Disconnected';
+                document.getElementById('statusText').className = 'disconnected';
+                console.log('WebSocket disconnected');
+            };
+        }
+
+        function disconnectWS() {
+            if (ws) {
+                ws.close();
+            }
+        }
+
+        // Initialize on load
+        window.onload = initChart;
+    </script>
+</body>
+</html>

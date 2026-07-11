@@ -1,0 +1,39 @@
+# FastAPI and server
+fastapi
+uvicorn[standard]
+
+# Database
+psycopg2-binary
+
+# AI/LLM
+anthropic
+
+# Task scheduling
+apscheduler
+
+# Environment variables
+python-decouple
+python-dotenv
+
+# Authentication
+PyJWT
+
+# Data processing
+pandas
+numpy
+pandas-ta
+
+# WebSockets
+websockets
+
+# Interactive Brokers
+ib_insync
+
+# Kafka
+kafka-python
+
+# Utilities
+python-dateutil
+
+# Chart generation
+mplfinance

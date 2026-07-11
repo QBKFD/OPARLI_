@@ -1,0 +1,37 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ---- Virtual environments / vendored deps ----
+venv/
+backend/venv/
+design_files/
+env/
+.venv/
+
+# ---- Secrets / env ----
+.env
+.env.*
+!.env.example
+backend/.env
+
+# ---- OS / editor ----
+.DS_Store
+.vscode/
+.idea/
+
+# ---- Data & artifacts (large, regenerable) ----
+*.log
+/tmp/
+database/ohlcv_data/*.csv
+database/historical_news/*.csv
+scratchpad/
+database/ohlcv_data/*.parquet
+database/ohlcv_data/*.csv
+database/historical_news/*.parquet
+database/ohlcv_data/*.txt
+database/ohlcv_data/*.zip
+database/historical_news/*.txt
