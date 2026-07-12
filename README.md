@@ -199,16 +199,37 @@ algo_project/
 ## Research Stack
 
 Independent of the live pipeline, the repository carries a substantial research
-effort used to decide *what* the agents should look for.
+effort used to decide *what* the agents should look for. Most of it lives in the
+notebooks under [notebooks/](notebooks/), backed by scripts and a standalone
+engine.
 
-- **SMC strategy validation.** Scripts under [scripts/](scripts/) backtest Smart
-  Money Concepts patterns — order blocks, fair value gaps, break of
-  structure / change of character, liquidity sweeps, opening-range breakout /
-  fade — with train/test splits and walk-forward analysis. Findings are written
-  up in [notebooks/SMC_STRATEGY_GUIDE.md](notebooks/SMC_STRATEGY_GUIDE.md),
-  including displacement and mitigation filters, higher-timeframe trend gating,
-  and session/hour win-rate tables. Strategies that failed validation are kept
-  under [scripts/no_go_strategies/](scripts/no_go_strategies/) as a record.
+- **Research notebooks.** [notebooks/](notebooks/) is where hypotheses are
+  formed and tested before anything reaches the agents:
+  - [backtest.ipynb](notebooks/backtest.ipynb) — the main research notebook. It
+    covers session definitions (UTC, DST-split), a key-level engine and touch-
+    outcome study built to be free of look-ahead by construction (levels carry
+    an `active_from`, outcomes measured in $ and ATR units over 15m/1h/4h), a
+    mandatory matched-random baseline control, pre-registered conditions with
+    multiple-comparison correction, unit tests, and a time-series-momentum
+    (TSMOM) study with train / sealed-window splits and block-bootstrap
+    significance testing. It exports touch-event and signal datasets that feed
+    the live scanner.
+  - [smc_validation_backtest.ipynb](notebooks/smc_validation_backtest.ipynb) —
+    full Smart Money Concepts validation: order blocks, fair value gaps, break
+    of structure / change of character, and liquidity sweeps, each with proper
+    filters (displacement, mitigation, higher-timeframe trend gating).
+  - [multi_agent_simulation.ipynb](notebooks/multi_agent_simulation.ipynb) —
+    replays the multi-agent pipeline over historical CSV data using the same
+    shared services as production, so agent behaviour can be studied offline.
+- **SMC findings.** Validated conclusions are written up in
+  [notebooks/SMC_STRATEGY_GUIDE.md](notebooks/SMC_STRATEGY_GUIDE.md) —
+  displacement and mitigation filters, higher-timeframe trend gating, and
+  session/hour win-rate tables.
+- **Validation scripts.** [scripts/](scripts/) holds runnable counterparts to
+  the notebook studies (SMC sweeps, order-block/FVG/BOS-CHoCH validation,
+  opening-range breakout / fade, train/test splits, walk-forward analysis).
+  Strategies that failed validation are kept under
+  [scripts/no_go_strategies/](scripts/no_go_strategies/) as a record.
 - **Regime classifier.** [regime_classifier/](regime_classifier/) implements a
   three-state (trending / ranging / volatile) statistical jump model with a jump
   penalty tuned to downstream strategy Sharpe rather than log-likelihood, sparse
@@ -278,9 +299,6 @@ IB_CLIENT_ID=1
 The frontend reads its own `frontend/.env` (`VITE_API_BASE_URL`, `VITE_WS_URL`,
 `VITE_API_KEY`).
 
-> **Security note:** do not commit `.env`. Rotate any key that has ever been
-> committed — removing a secret from the working tree does not remove it from git
-> history.
 
 ## Running the System
 
