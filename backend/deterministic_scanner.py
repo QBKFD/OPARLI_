@@ -209,8 +209,8 @@ def counterfactual(df: pd.DataFrame, ts_str: str, price: float) -> dict:
 
 
 # ── Append-only SQLite log ─────────────────────────────────────────────────
-def open_log(path=DB_PATH) -> sqlite3.Connection:
-    con = sqlite3.connect(str(path))
+def open_log(path=DB_PATH, check_same_thread=True) -> sqlite3.Connection:
+    con = sqlite3.connect(str(path), check_same_thread=check_same_thread)
     con.executescript("""
       CREATE TABLE IF NOT EXISTS alerts(
         alert_id TEXT, alert_ts_utc TEXT, level_types TEXT, level_price REAL,
@@ -238,6 +238,132 @@ def insert_counterfactual(con, alert_id: str, cf: dict):
     con.execute("INSERT INTO counterfactuals VALUES(?,?,?,?,?,?,?,?,?,datetime('now'))",
                 (alert_id, cf["fwd_high_1h"], cf["fwd_low_1h"], cf["mfe_up_1h"], cf["mfe_dn_1h"],
                  cf["fwd_high_4h"], cf["fwd_low_4h"], cf["mfe_up_4h"], cf["mfe_dn_4h"]))
+
+
+def _utc(ts) -> pd.Timestamp:
+    """Parse a stored/naive timestamp as UTC (stored alert timestamps are naive)."""
+    t = pd.Timestamp(ts)
+    return t.tz_localize("UTC") if t.tz is None else t.tz_convert("UTC")
+
+
+def record_decision(con, alert_id, decision, decision_ts, alert_ts, direction=None,
+                    entry=None, stop=None, target=None, reasoning="", source="telegram"):
+    """Append a decision. reasoning_ts == decision_ts, which is the proof that the
+    reasoning was recorded at decision time, not reconstructed with hindsight."""
+    mins = (_utc(decision_ts) - _utc(alert_ts)).total_seconds() / 60
+    con.execute("INSERT INTO decisions VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (alert_id, decision, str(decision_ts), round(mins, 2), direction,
+                 entry, stop, target, reasoning, str(decision_ts), source))
+    con.commit()
+
+
+def record_outcome(con, alert_id, exit_price, r_multiple, exit_type):
+    con.execute("INSERT INTO outcomes VALUES(?,?,?,?,datetime('now'))",
+                (alert_id, exit_price, r_multiple, exit_type))
+    con.commit()
+
+
+def undecided_alerts(con):
+    """alert rows that have no decision row yet, with their alert timestamp."""
+    return con.execute(
+        "SELECT a.alert_id, a.alert_ts_utc FROM alerts a "
+        "LEFT JOIN decisions d ON a.alert_id = d.alert_id WHERE d.alert_id IS NULL"
+    ).fetchall()
+
+
+def sweep_auto_missed(con, now_utc) -> int:
+    """MISSED = never saw it. Auto-assign to any alert with no reply after 4h, so
+    it is excluded from the TAKE-vs-SKIP comparison rather than polluting it."""
+    now = _utc(now_utc)
+    n = 0
+    for alert_id, alert_ts in undecided_alerts(con):
+        if (now - _utc(alert_ts)).total_seconds() >= MISSED_AFTER_H * 3600:
+            record_decision(con, alert_id, "MISSED", now, alert_ts,
+                            reasoning=f"auto: no reply within {MISSED_AFTER_H}h", source="auto")
+            n += 1
+    return n
+
+
+# ── Telegram (stdlib only — message carries facts, never a recommendation) ──
+def format_alert(a: dict) -> str:
+    """EXACTLY the fields the spec allows: id, ts UTC, level type(s), level
+    price, current price, session, confluence. No bias, no commentary."""
+    return (f"{a['alert_id']}\n"
+            f"{a['alert_ts_utc']} UTC\n"
+            f"{a['session']}\n"
+            f"{a['level_types']} @ {a['level_price']}\n"
+            f"price {a['price_at_alert']}\n"
+            f"confluence {a['confluence_count']}")
+
+
+def parse_reply(text: str) -> dict | None:
+    """Parse a human reply. Deterministic, no interpretation.
+       '<id> TAKE long 4128 sl 4122 tp 4140 <reason>'  or  '<id> SKIP <reason>'."""
+    tok = text.strip().split()
+    if len(tok) < 2:
+        return None
+    alert_id, verb = tok[0], tok[1].upper()
+    if verb == "SKIP":
+        return dict(alert_id=alert_id, decision="SKIP", reasoning=" ".join(tok[2:]))
+    if verb == "TAKE":
+        d = dict(alert_id=alert_id, decision="TAKE", direction=None,
+                 entry=None, stop=None, target=None, reasoning="")
+        rest = tok[2:]
+        if rest and rest[0].lower() in ("long", "short"):
+            d["direction"] = rest[0].lower(); rest = rest[1:]
+        if rest and _isnum(rest[0]):
+            d["entry"] = float(rest[0]); rest = rest[1:]
+        i = 0
+        while i < len(rest):
+            w = rest[i].lower()
+            if w == "sl" and i + 1 < len(rest) and _isnum(rest[i + 1]):
+                d["stop"] = float(rest[i + 1]); i += 2; continue
+            if w == "tp" and i + 1 < len(rest) and _isnum(rest[i + 1]):
+                d["target"] = float(rest[i + 1]); i += 2; continue
+            break
+        d["reasoning"] = " ".join(rest[i:])
+        return d
+    return None
+
+
+def _isnum(s: str) -> bool:
+    try:
+        float(s); return True
+    except ValueError:
+        return False
+
+
+class Telegram:
+    """Thin sendMessage / getUpdates wrapper. Token + chat id from env."""
+    def __init__(self):
+        import os
+        self.token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        self.chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+        if not self.token or not self.chat_id:
+            raise RuntimeError("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the environment")
+        self._base = f"https://api.telegram.org/bot{self.token}"
+
+    def _get(self, method, params):
+        import json
+        import urllib.parse
+        import urllib.request
+        url = f"{self._base}/{method}?{urllib.parse.urlencode(params)}"
+        with urllib.request.urlopen(url, timeout=70) as r:
+            return json.load(r)
+
+    def send(self, text: str):
+        return self._get("sendMessage", {"chat_id": self.chat_id, "text": text})
+
+    def poll(self, offset: int):
+        """Long-poll replies. Returns (messages, next_offset)."""
+        res = self._get("getUpdates", {"offset": offset, "timeout": 60})
+        msgs, nxt = [], offset
+        for u in res.get("result", []):
+            nxt = u["update_id"] + 1
+            m = u.get("message") or {}
+            if str(m.get("chat", {}).get("id")) == str(self.chat_id) and "text" in m:
+                msgs.append(m["text"])
+        return msgs, nxt
 
 
 # ── Replay ──────────────────────────────────────────────────────────────────
@@ -273,6 +399,100 @@ def replay_day(date: str, con=None) -> pd.DataFrame:
     if con is not None:
         con.commit()
     return pd.DataFrame(rows)
+
+
+# ── Live loop (reuses tws_connector for the feed, Postgres for level history) ─
+def _load_recent_history(symbol: str, days: int = 10) -> pd.DataFrame:
+    """Recent 1-min bars from the existing ohlcv_1min view — needed so the level
+    engine has yesterday's / last week's / today's session data to build from."""
+    from config.database import get_database
+    db = get_database()
+    q = ("SELECT timestamp AT TIME ZONE 'UTC' AS timestamp, open, high, low, close "
+         "FROM ohlcv_1min WHERE symbol=%s AND timestamp >= now() - interval '%s days' "
+         "ORDER BY timestamp ASC")
+    with db.get_cursor() as cur:
+        cur.execute(q, (symbol, days))
+        rows = cur.fetchall()
+    df = pd.DataFrame(rows)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    return df.set_index("timestamp")[["open", "high", "low", "close"]].astype(float).sort_index()
+
+
+def run_live(symbol: str = "XAUUSD"):
+    """Live path: identical scanner code, fed by real IBKR bars. Telegram sends
+    each alert and receives TAKE/SKIP replies. UNVERIFIED in this environment
+    (needs TWS running, Postgres with current data, and Telegram credentials)."""
+    import os
+    import threading
+    import time as _time
+    from services.tws_connector import TWSConnector
+
+    tg = Telegram()
+    con = open_log(check_same_thread=False)
+    lock = threading.Lock()
+
+    hist = _load_recent_history(symbol)
+    state = {"day": None, "scanner": None, "hist": hist}
+
+    def rebuild(now):
+        state["day"] = now.normalize()
+        state["scanner"] = Scanner(build_levels(state["hist"]))
+        # warm scanner state on today's bars-so-far WITHOUT emitting (so we don't
+        # Telegram-blast levels price already visited before we came online)
+        for ts, o, h, l, c in state["hist"].loc[state["day"]:now].itertuples(name=None):
+            state["scanner"].on_bar(ts, o, h, l, c)
+
+    rebuild(pd.Timestamp.now(tz="UTC"))
+
+    def on_bar(_sym, bar):
+        if not bar.get("is_final"):
+            return
+        ts = pd.Timestamp(bar["timestamp"]); ts = ts.tz_convert("UTC") if ts.tz else ts.tz_localize("UTC")
+        o, h, l, c = bar["open"], bar["high"], bar["low"], bar["close"]
+        with lock:
+            state["hist"].loc[ts] = [o, h, l, c]
+            if ts.normalize() != state["day"]:
+                rebuild(ts)
+            for a in state["scanner"].on_bar(ts, o, h, l, c):
+                insert_alert(con, a); con.commit()
+                try:
+                    tg.send(format_alert(a))
+                except Exception as e:  # a send failure must not kill the feed
+                    print(f"telegram send failed for {a['alert_id']}: {e}")
+
+    tws = TWSConnector(host=os.environ.get("IB_HOST", "127.0.0.1"),
+                       port=int(os.environ.get("IB_PORT", "4002")),
+                       client_id=int(os.environ.get("IB_CLIENT_ID", "11")))
+    tws.on_bar_update(on_bar)
+    if not tws.connect():
+        raise RuntimeError("Could not connect to TWS/IB Gateway")
+    tws.subscribe_bars(symbol, exchange="SMART", sec_type="CMDTY", currency="USD")
+    print(f"LIVE: scanning {symbol}. Alerts → Telegram; reply '<id> TAKE|SKIP ...'. Ctrl-C to stop.")
+
+    offset = 0
+    last_sweep = 0.0
+    try:
+        while True:
+            msgs, offset = tg.poll(offset)
+            for text in msgs:
+                r = parse_reply(text)
+                if not r:
+                    continue
+                with lock:
+                    row = con.execute("SELECT alert_ts_utc FROM alerts WHERE alert_id=?",
+                                      (r["alert_id"],)).fetchone()
+                    if not row:
+                        tg.send(f"unknown alert_id {r['alert_id']}"); continue
+                    record_decision(con, r["alert_id"], r["decision"], pd.Timestamp.now(tz="UTC"),
+                                    row[0], r.get("direction"), r.get("entry"), r.get("stop"),
+                                    r.get("target"), r.get("reasoning"))
+                    tg.send(f"logged {r['decision']} for {r['alert_id']}")
+            if _time.time() - last_sweep > 300:      # sweep auto-MISSED every 5 min
+                with lock:
+                    sweep_auto_missed(con, pd.Timestamp.now(tz="UTC"))
+                last_sweep = _time.time()
+    except KeyboardInterrupt:
+        print("\nstopping."); tws.disconnect()
 
 
 # ── Self-test: no look-ahead + first-touch dedup (from the notebook) ────────
@@ -324,6 +544,36 @@ def selftest():
     got += sc.close()
     if len(got) != 1 or got[0]["alert_ts_utc"][-8:] != "00:05:00":
         fails.append(f"open-arming: {[g['alert_ts_utc'] for g in got]} (want one, at 00:05 the return)")
+    # 5) reply parser (deterministic, no interpretation)
+    t = parse_reply("A20250616-005 TAKE long 4128 sl 4122 tp 4140 london low reclaim")
+    if not (t and t["decision"] == "TAKE" and t["direction"] == "long" and t["entry"] == 4128.0
+            and t["stop"] == 4122.0 and t["target"] == 4140.0 and t["reasoning"] == "london low reclaim"):
+        fails.append(f"parse TAKE: {t}")
+    s = parse_reply("A20250616-002 SKIP no structure, into news")
+    if not (s and s["decision"] == "SKIP" and s["reasoning"] == "no structure, into news"):
+        fails.append(f"parse SKIP: {s}")
+    if parse_reply("garbage") is not None:
+        fails.append("parse garbage should be None")
+    # 6) alert message carries ONLY the allowed fields (no recommendation)
+    msg = format_alert(dict(alert_id="A1", alert_ts_utc="2025-06-16 00:06:00", session="ASIA",
+                            level_types="DOPEN,WOPEN", level_price=3443.998,
+                            price_at_alert=3442.985, confluence_count=2))
+    banned = ("buy", "sell", "long", "short", "take", "skip", "recommend", "signal", "trade")
+    if any(b in msg.lower() for b in banned):
+        fails.append("alert message contains a recommendation word")
+    # 7) auto-MISSED after 4h, and not before
+    import tempfile
+    con = open_log(Path(tempfile.mkdtemp()) / "t.sqlite")
+    insert_alert(con, dict(alert_id="A_old", alert_ts_utc="2025-06-16 00:00:00", level_types="PDH",
+                           level_price=1.0, price_at_alert=1.0, session="ASIA", confluence_count=1))
+    insert_alert(con, dict(alert_id="A_new", alert_ts_utc="2025-06-16 03:30:00", level_types="PDL",
+                           level_price=1.0, price_at_alert=1.0, session="ASIA", confluence_count=1))
+    con.commit()
+    n = sweep_auto_missed(con, pd.Timestamp("2025-06-16 04:30:00", tz="UTC"))
+    decided = dict(con.execute("SELECT alert_id, decision FROM decisions").fetchall())
+    if not (n == 1 and decided.get("A_old") == "MISSED" and "A_new" not in decided):
+        fails.append(f"auto-MISSED: n={n} decided={decided}")
+
     print("SELFTEST:", "ALL PASSED" if not fails else f"FAILED {fails}")
     return not fails
 
@@ -332,13 +582,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", help="UTC day to replay, e.g. 2025-06-16")
     ap.add_argument("--db", default=None, help="write alerts+counterfactuals to this sqlite file")
+    ap.add_argument("--live", action="store_true", help="run live on IBKR + Telegram (needs TWS + env creds)")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
     if args.selftest:
         raise SystemExit(0 if selftest() else 1)
+    if args.live:
+        run_live()
+        return
     if not args.date:
-        ap.error("give --date YYYY-MM-DD or --selftest")
+        ap.error("give --date YYYY-MM-DD, --live, or --selftest")
 
     con = open_log(args.db) if args.db else None
     out = replay_day(args.date, con)
