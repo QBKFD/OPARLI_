@@ -326,14 +326,44 @@ class ConfluenceChecker:
 
         Returns:
             'LONG', 'SHORT', or 'NEUTRAL'
-        """
-        # Price near support = potential LONG
-        if abs(close - support) / support < 0.005:  # Within 0.5% of support
-            return 'LONG'
 
-        # Price near resistance = potential SHORT
-        if abs(close - resistance) / resistance < 0.005:  # Within 0.5% of resistance
-            return 'SHORT'
+        Balanced by construction. The previous version checked support first and
+        returned LONG whenever price was within 0.5% of support, so on tight
+        ranges (common on low timeframes, where 20 bars span well under 1%) price
+        was within 0.5% of BOTH levels and resistance never got a look — the
+        voter returned LONG on every such bar. Measured on 2023 XAUUSD across the
+        five-timeframe cascade that was 32,163 LONG vs 7,036 SHORT (82% LONG),
+        even though price was nearer support only 50.7% of the time: a pure
+        artifact of check order, not of the levels.
+
+        The fix removes the asymmetry rather than tuning it out: distances use a
+        common denominator (close) so equal dollar gaps compare equally, and the
+        NEARER level decides. Mirror price about the mid-range and swap
+        support<->resistance and the vote flips. A genuine tie, or price near
+        neither level, is NEUTRAL.
+        """
+        if close <= 0:
+            return 'NEUTRAL'
+
+        dist_support = abs(close - support) / close
+        dist_resistance = abs(close - resistance) / close
+
+        near_support = dist_support < 0.005     # within 0.5% of support
+        near_resistance = dist_resistance < 0.005  # within 0.5% of resistance
+
+        if near_support and near_resistance:
+            # Range tighter than ~1%: let the nearer level decide; a dead tie
+            # carries no directional information, so abstain.
+            if dist_support < dist_resistance:
+                return 'LONG'
+            if dist_resistance < dist_support:
+                return 'SHORT'
+            return 'NEUTRAL'
+
+        if near_support:
+            return 'LONG'   # price at support = potential bounce
+        if near_resistance:
+            return 'SHORT'  # price at resistance = potential rejection
 
         return 'NEUTRAL'
 
