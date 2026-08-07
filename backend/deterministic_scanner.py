@@ -402,20 +402,26 @@ def replay_day(date: str, con=None) -> pd.DataFrame:
 
 
 # ── Live loop (reuses tws_connector for the feed, Postgres for level history) ─
-def _load_recent_history(symbol: str, days: int = 10) -> pd.DataFrame:
-    """Recent 1-min bars from the existing ohlcv_1min view — needed so the level
-    engine has yesterday's / last week's / today's session data to build from."""
-    from config.database import get_database
-    db = get_database()
-    q = ("SELECT timestamp AT TIME ZONE 'UTC' AS timestamp, open, high, low, close "
-         "FROM ohlcv_1min WHERE symbol=%s AND timestamp >= now() - interval '%s days' "
-         "ORDER BY timestamp ASC")
-    with db.get_cursor() as cur:
-        cur.execute(q, (symbol, days))
-        rows = cur.fetchall()
-    df = pd.DataFrame(rows)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    return df.set_index("timestamp")[["open", "high", "low", "close"]].astype(float).sort_index()
+def _load_recent_history(symbol: str, days: int, host: str, port: int, client_id: int) -> pd.DataFrame:
+    """Recent 1-min bars straight from IBKR (MIDPOINT, same pricing the live feed
+    builds from) so the level engine has yesterday's / last week's / today's
+    session data to build from. Deliberately NOT the Postgres ohlcv_1min view —
+    that stops at the last backfill and would leave the scanner with no levels."""
+    from ib_insync import IB, Contract
+    ib = IB()
+    ib.connect(host, port, clientId=client_id, timeout=10)
+    try:
+        c = ib.qualifyContracts(Contract(symbol=symbol, secType="CMDTY", exchange="SMART", currency="USD"))[0]
+        bars = ib.reqHistoricalData(c, endDateTime="", durationStr=f"{days} D",
+                                    barSizeSetting="1 min", whatToShow="MIDPOINT",
+                                    useRTH=False, formatDate=2)
+    finally:
+        ib.disconnect()
+    df = pd.DataFrame([(b.date, b.open, b.high, b.low, b.close) for b in bars],
+                      columns=["timestamp", "open", "high", "low", "close"]).set_index("timestamp")
+    df.index = pd.DatetimeIndex(df.index)
+    df.index = df.index.tz_localize("UTC") if df.index.tz is None else df.index.tz_convert("UTC")
+    return df[["open", "high", "low", "close"]].astype(float).sort_index()
 
 
 def run_live(symbol: str = "XAUUSD"):
@@ -427,11 +433,16 @@ def run_live(symbol: str = "XAUUSD"):
     import time as _time
     from services.tws_connector import TWSConnector
 
+    host = os.environ.get("IB_HOST", "127.0.0.1")
+    port = int(os.environ.get("IB_PORT", "7497"))
+    client_id = int(os.environ.get("IB_CLIENT_ID", "11"))
+
     tg = Telegram()
     con = open_log(check_same_thread=False)
     lock = threading.Lock()
 
-    hist = _load_recent_history(symbol)
+    # history first (separate short-lived connection, distinct clientId)
+    hist = _load_recent_history(symbol, days=10, host=host, port=port, client_id=client_id + 10)
     state = {"day": None, "scanner": None, "hist": hist}
 
     def rebuild(now):
@@ -460,9 +471,7 @@ def run_live(symbol: str = "XAUUSD"):
                 except Exception as e:  # a send failure must not kill the feed
                     print(f"telegram send failed for {a['alert_id']}: {e}")
 
-    tws = TWSConnector(host=os.environ.get("IB_HOST", "127.0.0.1"),
-                       port=int(os.environ.get("IB_PORT", "4002")),
-                       client_id=int(os.environ.get("IB_CLIENT_ID", "11")))
+    tws = TWSConnector(host=host, port=port, client_id=client_id)
     tws.on_bar_update(on_bar)
     if not tws.connect():
         raise RuntimeError("Could not connect to TWS/IB Gateway")
