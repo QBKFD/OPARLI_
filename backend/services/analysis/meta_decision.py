@@ -216,6 +216,38 @@ class MetaDecisionService:
             breakdown
         )
 
+    # Vocabularies analysts have historically used for the same two directions.
+    # Normalising here means an analyst whose wording drifts gets scored rather
+    # than silently contributing 0.0 while still consuming its weight.
+    _SIGNAL_ALIASES = {
+        'BUY': 'LONG', 'BULLISH': 'LONG', 'LONG': 'LONG',
+        'SELL': 'SHORT', 'BEARISH': 'SHORT', 'SHORT': 'SHORT',
+        'PASS': 'PASS', 'NEUTRAL': 'PASS', 'HOLD': 'PASS',
+    }
+
+    @classmethod
+    def normalize_analysis(cls, analysis: Dict) -> Tuple[str, float]:
+        """
+        Coerce one analyst result to (LONG|SHORT|PASS, confidence in 0-1).
+
+        Unknown signals become PASS: an analyst we cannot interpret must be
+        treated as abstaining, never as agreeing.
+        """
+        raw = str(analysis.get('signal', 'NEUTRAL')).strip().upper()
+        signal = cls._SIGNAL_ALIASES.get(raw)
+        if signal is None:
+            logger.warning(f"Unrecognised analyst signal '{raw}', treating as PASS")
+            signal = 'PASS'
+
+        try:
+            confidence = float(analysis.get('confidence', 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if confidence > 1.0:
+            confidence = confidence / 100.0
+
+        return signal, max(0.0, min(1.0, confidence))
+
     def calculate_weighted_score(
         self,
         visual: Dict,
@@ -239,13 +271,15 @@ class MetaDecisionService:
             'technical': technical,
             'sentiment': sentiment
         }
+        normalized = {
+            name: self.normalize_analysis(analysis)
+            for name, analysis in analyses.items()
+        }
 
         # Calculate weighted score for each direction
         scores = {'LONG': 0.0, 'SHORT': 0.0}
 
-        for analyst_name, analysis in analyses.items():
-            signal = analysis.get('signal', 'NEUTRAL').upper()
-            confidence = analysis.get('confidence', 0.0)
+        for analyst_name, (signal, confidence) in normalized.items():
             weight = self.weights.get(analyst_name, 0.0)
 
             if signal in scores:
@@ -255,9 +289,9 @@ class MetaDecisionService:
 
         # Calculate agreement
         signals = [
-            visual.get('signal', 'NEUTRAL').upper(),
-            technical.get('signal', 'NEUTRAL').upper(),
-            sentiment.get('signal', 'NEUTRAL').upper()
+            normalized['visual'][0],
+            normalized['technical'][0],
+            normalized['sentiment'][0],
         ]
 
         long_count = signals.count('LONG')
@@ -391,15 +425,19 @@ class MetaDecisionService:
 
         Uses threshold-based logic matching the prompt rules.
         """
-        # Determine direction
-        v_sig = visual.get('signal', 'NEUTRAL').upper()
-        t_sig = technical.get('signal', 'NEUTRAL').upper()
+        # Determine direction (same normalisation the scorer used, so the
+        # direction can never disagree with the score that justified it)
+        v_sig, _ = self.normalize_analysis(visual)
+        t_sig, _ = self.normalize_analysis(technical)
+        s_sig, _ = self.normalize_analysis(sentiment)
 
         # Priority: Technical > Visual > Sentiment
         if t_sig in ['LONG', 'SHORT']:
             direction = t_sig
         elif v_sig in ['LONG', 'SHORT']:
             direction = v_sig
+        elif s_sig in ['LONG', 'SHORT']:
+            direction = s_sig
         else:
             direction = 'PASS'
 
@@ -418,9 +456,9 @@ class MetaDecisionService:
             'agreement': agreement,
             'reasoning': 'Deterministic decision (LLM unavailable)',
             'analyst_breakdown': {
-                'visual': {'signal': v_sig, 'confidence': visual.get('confidence', 0)},
-                'technical': {'signal': t_sig, 'confidence': technical.get('confidence', 0)},
-                'sentiment': {'signal': sentiment.get('signal', 'PASS'), 'confidence': sentiment.get('confidence', 0)}
+                'visual': {'signal': v_sig, 'confidence': self.normalize_analysis(visual)[1]},
+                'technical': {'signal': t_sig, 'confidence': self.normalize_analysis(technical)[1]},
+                'sentiment': {'signal': s_sig, 'confidence': self.normalize_analysis(sentiment)[1]}
             }
         }
 
