@@ -118,6 +118,17 @@ class MetaDecisionService:
     AGREEMENT_THRESHOLD_HIGH = 0.5
     AGREEMENT_THRESHOLD_LOW = 0.67
 
+    # Renormalise the weighted score over the analysts that actually voted,
+    # rather than over the full analyst roster. With this on, WEIGHTED_SCORE_*
+    # mean "weighted agreement AMONG PARTICIPATING analysts": a unanimous call at
+    # confidence c scores c whether 1 or 3 analysts voted. With it off, a scan
+    # where not all analysts vote is capped at sum(participating weights) < 1.0
+    # and can never clear the gate — a plumbing artifact, not a signal property.
+    # See calculate_weighted_score(). This is the intended semantics; the flag
+    # exists to name the behaviour and keep the old math inspectable, not as a
+    # runtime toggle to flip.
+    PARTICIPATION_RENORMALIZED = True
+
     def __init__(
         self,
         llm_client=None,
@@ -257,6 +268,13 @@ class MetaDecisionService:
         """
         Calculate weighted score and agreement.
 
+        The weighted score is RENORMALISED over the participating analysts (see
+        `PARTICIPATION_RENORMALIZED`): the per-direction conviction sum is divided
+        by the total weight of the analysts that actually cast a directional vote,
+        not by the full analyst roster. This makes the score mean exactly what the
+        decision thresholds claim — "weighted agreement among the analysts that
+        voted" — regardless of how many analysts ran.
+
         Args:
             visual: Visual analysis
             technical: Technical analysis
@@ -276,14 +294,33 @@ class MetaDecisionService:
             for name, analysis in analyses.items()
         }
 
-        # Calculate weighted score for each direction
-        scores = {'LONG': 0.0, 'SHORT': 0.0}
+        # Raw per-direction conviction: sum(confidence * weight) over the
+        # analysts pointing that way. A PASS is an abstention (see the agreement
+        # rules below), so it contributes to neither the numerator nor the
+        # denominator.
+        raw_scores = {'LONG': 0.0, 'SHORT': 0.0}
+        participating_weight = 0.0
 
         for analyst_name, (signal, confidence) in normalized.items():
+            if signal not in raw_scores:
+                continue  # PASS / abstention — excluded from the vote entirely
             weight = self.weights.get(analyst_name, 0.0)
+            raw_scores[signal] += confidence * weight
+            participating_weight += weight
 
-            if signal in scores:
-                scores[signal] += confidence * weight
+        # Renormalise over the participating weight. Without this, a scan where
+        # fewer than all analysts vote (e.g. Stage-1 technical-only) is capped at
+        # sum(weight_i) < 1.0 and can never clear the gate even at max confidence
+        # — a plumbing artifact of who happened to vote, not a property of the
+        # signal. Dividing by the participating weight makes a unanimous call at
+        # confidence c score exactly c whether 1 or 3 analysts voted.
+        if self.PARTICIPATION_RENORMALIZED and participating_weight > 0:
+            scores = {
+                direction: raw / participating_weight
+                for direction, raw in raw_scores.items()
+            }
+        else:
+            scores = dict(raw_scores)
 
         weighted_score = max(scores.values())
 
@@ -311,6 +348,8 @@ class MetaDecisionService:
         # Build breakdown
         breakdown = {
             'scores': scores,
+            'raw_scores': raw_scores,
+            'participating_weight': participating_weight,
             'signals': signals,
             'counts': {
                 'long': long_count,
