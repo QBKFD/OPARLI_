@@ -35,5 +35,8 @@ python-dateutil
 # Chart generation
 mplfinance
 
+# Parquet (deterministic_scanner reads the clean 1-min dataset)
+pyarrow
+
 # Testing
 pytest>=7.0
