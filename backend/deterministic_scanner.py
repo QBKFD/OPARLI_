@@ -284,6 +284,32 @@ def sweep_auto_missed(con, now_utc) -> int:
     return n
 
 
+def alerts_needing_counterfactual(con, now_utc):
+    """Alerts old enough that a full 4h forward window exists but with no
+    counterfactual row yet — the SKIP/MISSED 'what would have happened' data
+    can't be computed at alert time, only once the future bars arrive."""
+    now = _utc(now_utc)
+    rows = con.execute(
+        "SELECT a.alert_id, a.alert_ts_utc, a.price_at_alert FROM alerts a "
+        "LEFT JOIN counterfactuals cf ON a.alert_id = cf.alert_id WHERE cf.alert_id IS NULL"
+    ).fetchall()
+    horizon = max(CF_HORIZONS.values())
+    return [r for r in rows if (now - _utc(r[1])).total_seconds() >= horizon * 60]
+
+
+def sweep_counterfactuals(con, df, now_utc) -> int:
+    """Fill forward MFE/MAE for alerts whose 4h window has elapsed, from the
+    accumulated live bar frame. Runs live so the experiment data is captured."""
+    n = 0
+    for alert_id, alert_ts, price in alerts_needing_counterfactual(con, now_utc):
+        cf = counterfactual(df, alert_ts, price)
+        insert_counterfactual(con, alert_id, cf)
+        n += 1
+    if n:
+        con.commit()
+    return n
+
+
 # ── Telegram (stdlib only — message carries facts, never a recommendation) ──
 def format_alert(a: dict) -> str:
     """EXACTLY the fields the spec allows: id, ts UTC, level type(s), level
@@ -507,9 +533,13 @@ def run_live(symbol: str = "XAUUSD", dry: bool = False):
                                     row[0], r.get("direction"), r.get("entry"), r.get("stop"),
                                     r.get("target"), r.get("reasoning"))
                     tg.send(f"logged {r['decision']} for {r['alert_id']}")
-            if _time.time() - last_sweep > 300:      # sweep auto-MISSED every 5 min
+            if _time.time() - last_sweep > 300:      # every 5 min
                 with lock:
-                    sweep_auto_missed(con, pd.Timestamp.now(tz="UTC"))
+                    now = pd.Timestamp.now(tz="UTC")
+                    sweep_auto_missed(con, now)
+                    # counterfactuals need the future bars, so fill from the
+                    # accumulated live frame once each alert's 4h window elapses
+                    sweep_counterfactuals(con, state["hist"].sort_index(), now)
                 last_sweep = _time.time()
     except KeyboardInterrupt:
         print("\nstopping."); tws.disconnect()
@@ -593,6 +623,18 @@ def selftest():
     decided = dict(con.execute("SELECT alert_id, decision FROM decisions").fetchall())
     if not (n == 1 and decided.get("A_old") == "MISSED" and "A_new" not in decided):
         fails.append(f"auto-MISSED: n={n} decided={decided}")
+    # 8) counterfactual sweep: only alerts with a full 4h forward window get filled
+    insert_alert(con, dict(alert_id="A_cf", alert_ts_utc="2025-06-16 00:00:00", level_types="PDH",
+                           level_price=100.0, price_at_alert=100.0, session="ASIA", confluence_count=1))
+    con.commit()
+    fdf = pd.DataFrame({"open": 100.0, "high": 110.0, "low": 95.0, "close": 100.0},
+                       index=pd.date_range("2025-06-16 00:00", periods=300, freq="1min", tz="UTC"))
+    # A_cf (00:00) has >4h of bars; A_new (03:30) does not, at now=04:30
+    sweep_counterfactuals(con, fdf, pd.Timestamp("2025-06-16 04:30:00", tz="UTC"))
+    cfs = dict((r[0], (r[1], r[2])) for r in
+               con.execute("SELECT alert_id, mfe_up_4h, mfe_dn_4h FROM counterfactuals").fetchall())
+    if not (cfs.get("A_cf") == (10.0, 5.0) and "A_new" not in cfs):
+        fails.append(f"counterfactual sweep: cfs={cfs}")
 
     print("SELFTEST:", "ALL PASSED" if not fails else f"FAILED {fails}")
     return not fails
