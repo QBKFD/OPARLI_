@@ -114,10 +114,16 @@ class TWSConnector:
         """Disconnect from TWS"""
         try:
             if self.connected:
-                # Cancel all subscriptions
+                # Cancel all subscriptions with the matching cancel call: CMDTY is
+                # a reqMktData tick stream (cancelMktData); stocks/futures are
+                # reqRealTimeBars (cancelRealTimeBars). Using the wrong one raises
+                # "'Commodity' object has no attribute 'reqId'".
                 for symbol, contract in self.subscriptions.items():
                     try:
-                        self.ib.cancelRealTimeBars(contract)
+                        if getattr(contract, 'secType', None) == 'CMDTY':
+                            self.ib.cancelMktData(contract)
+                        else:
+                            self.ib.cancelRealTimeBars(contract)
                     except Exception as e:
                         logger.warning(f"Error canceling subscription for {symbol}: {e}")
 
@@ -292,7 +298,10 @@ class TWSConnector:
 
         try:
             contract = self.subscriptions[symbol]
-            self.ib.cancelRealTimeBars(contract)
+            if getattr(contract, 'secType', None) == 'CMDTY':
+                self.ib.cancelMktData(contract)   # CMDTY is a reqMktData tick stream
+            else:
+                self.ib.cancelRealTimeBars(contract)
             del self.subscriptions[symbol]
 
             logger.info(f"✓ Unsubscribed from {symbol}")

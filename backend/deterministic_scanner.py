@@ -424,10 +424,12 @@ def _load_recent_history(symbol: str, days: int, host: str, port: int, client_id
     return df[["open", "high", "low", "close"]].astype(float).sort_index()
 
 
-def run_live(symbol: str = "XAUUSD"):
-    """Live path: identical scanner code, fed by real IBKR bars. Telegram sends
-    each alert and receives TAKE/SKIP replies. UNVERIFIED in this environment
-    (needs TWS running, Postgres with current data, and Telegram credentials)."""
+def run_live(symbol: str = "XAUUSD", dry: bool = False):
+    """Live path: identical scanner code, fed by real IBKR bars.
+
+    dry=False: alerts go to Telegram, TAKE/SKIP replies are logged, MISSED swept.
+    dry=True : alerts print to the terminal, no Telegram at all — for watching the
+               live feed + scanner without spending messages or needing creds."""
     import os
     import threading
     import time as _time
@@ -437,7 +439,7 @@ def run_live(symbol: str = "XAUUSD"):
     port = int(os.environ.get("IB_PORT", "7497"))
     client_id = int(os.environ.get("IB_CLIENT_ID", "11"))
 
-    tg = Telegram()
+    tg = None if dry else Telegram()
     con = open_log(check_same_thread=False)
     lock = threading.Lock()
 
@@ -449,7 +451,7 @@ def run_live(symbol: str = "XAUUSD"):
         state["day"] = now.normalize()
         state["scanner"] = Scanner(build_levels(state["hist"]))
         # warm scanner state on today's bars-so-far WITHOUT emitting (so we don't
-        # Telegram-blast levels price already visited before we came online)
+        # blast alerts for levels price already visited before we came online)
         for ts, o, h, l, c in state["hist"].loc[state["day"]:now].itertuples(name=None):
             state["scanner"].on_bar(ts, o, h, l, c)
 
@@ -466,22 +468,31 @@ def run_live(symbol: str = "XAUUSD"):
                 rebuild(ts)
             for a in state["scanner"].on_bar(ts, o, h, l, c):
                 insert_alert(con, a); con.commit()
-                try:
-                    tg.send(format_alert(a))
-                except Exception as e:  # a send failure must not kill the feed
-                    print(f"telegram send failed for {a['alert_id']}: {e}")
+                if dry:
+                    print("ALERT  " + format_alert(a).replace("\n", " | "), flush=True)
+                else:
+                    try:
+                        tg.send(format_alert(a))
+                    except Exception as e:  # a send failure must not kill the feed
+                        print(f"telegram send failed for {a['alert_id']}: {e}")
 
     tws = TWSConnector(host=host, port=port, client_id=client_id)
     tws.on_bar_update(on_bar)
     if not tws.connect():
         raise RuntimeError("Could not connect to TWS/IB Gateway")
     tws.subscribe_bars(symbol, exchange="SMART", sec_type="CMDTY", currency="USD")
-    print(f"LIVE: scanning {symbol}. Alerts → Telegram; reply '<id> TAKE|SKIP ...'. Ctrl-C to stop.")
+    active = sum(1 for L in build_levels(state["hist"])
+                 if L["active_from"] <= pd.Timestamp.now(tz="UTC") < L["active_to"])
+    mode = "DRY (terminal)" if dry else "LIVE (Telegram)"
+    print(f"{mode}: scanning {symbol}, {active} levels active. Ctrl-C to stop.", flush=True)
 
     offset = 0
     last_sweep = 0.0
     try:
         while True:
+            if dry:
+                _time.sleep(2)
+                continue
             msgs, offset = tg.poll(offset)
             for text in msgs:
                 r = parse_reply(text)
@@ -592,16 +603,17 @@ def main():
     ap.add_argument("--date", help="UTC day to replay, e.g. 2025-06-16")
     ap.add_argument("--db", default=None, help="write alerts+counterfactuals to this sqlite file")
     ap.add_argument("--live", action="store_true", help="run live on IBKR + Telegram (needs TWS + env creds)")
+    ap.add_argument("--dry-live", action="store_true", help="run live on IBKR but print alerts to terminal (no Telegram)")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
     if args.selftest:
         raise SystemExit(0 if selftest() else 1)
-    if args.live:
-        run_live()
+    if args.live or args.dry_live:
+        run_live(dry=args.dry_live)
         return
     if not args.date:
-        ap.error("give --date YYYY-MM-DD, --live, or --selftest")
+        ap.error("give --date YYYY-MM-DD, --live, --dry-live, or --selftest")
 
     con = open_log(args.db) if args.db else None
     out = replay_day(args.date, con)
