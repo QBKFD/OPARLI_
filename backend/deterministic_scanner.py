@@ -22,6 +22,7 @@ Self-test: python backend/deterministic_scanner.py --selftest
 from __future__ import annotations
 
 import argparse
+import os
 import sqlite3
 from collections import defaultdict
 from pathlib import Path
@@ -30,7 +31,10 @@ import pandas as pd
 
 # ── Calibration (2023-2025, do not retune) ─────────────────────────────────
 PARQUET = Path(__file__).resolve().parent.parent / "database/ohlcv_data/XAUUSD_1min_UTC_clean.parquet"
-DB_PATH = Path(__file__).resolve().parent.parent / "database/scanner_decisions.sqlite"
+# SCANNER_DB lets the container point the append-only journal at a mounted
+# volume so decisions survive restarts / redeploys.
+DB_PATH = Path(os.environ.get(
+    "SCANNER_DB", Path(__file__).resolve().parent.parent / "database/scanner_decisions.sqlite"))
 SESSIONS = {"ASIA": (0, 7), "LONDON": (7, 12), "NY": (12, 21)}  # UTC hours [start,end)
 MIN_BARS_FULL_DAY = 300          # a full trading day needs >= this many bars
 SESSION_CARRY_H = 24             # session H/L stay active +24h after close

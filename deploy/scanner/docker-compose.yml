@@ -1,0 +1,47 @@
+# Always-on deterministic scanner on Oracle (or any Docker host).
+#   ibgateway : IB Gateway + IBC (headless, auto-login, auto-daily-restart)
+#   scanner   : deterministic_scanner.py --live, connects to ibgateway
+#
+# Deploy:  cp .env.example .env  &&  edit .env  &&  docker compose up -d --build
+# The gnzsnz/ib-gateway image is multi-arch (works on Oracle Ampere / arm64).
+
+services:
+  ibgateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    restart: unless-stopped
+    environment:
+      TWS_USERID: ${TWS_USERID}
+      TWS_PASSWORD: ${TWS_PASSWORD}
+      TRADING_MODE: ${TRADING_MODE:-paper}     # paper: same market data, no order risk
+      READ_ONLY_API: ${READ_ONLY_API:-yes}     # scanner only reads — keep this yes
+      TWOFA_TIMEOUT_ACTION: restart
+      AUTO_RESTART_TIME: ${AUTO_RESTART_TIME:-11:45 PM}
+      TIME_ZONE: ${TIME_ZONE:-Etc/UTC}
+      VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD:-}
+    ports:
+      # VNC bound to localhost only — SSH-tunnel in for the weekly 2FA login.
+      - "127.0.0.1:5900:5900"
+    networks: [scannernet]
+
+  scanner:
+    build:
+      context: ../..                 # repo root, so the Dockerfile can COPY backend/
+      dockerfile: deploy/scanner/Dockerfile
+    restart: unless-stopped
+    depends_on: [ibgateway]
+    environment:
+      IB_HOST: ibgateway
+      IB_PORT: ${IB_PORT:-4002}       # 4002 paper / 4001 live — match TRADING_MODE
+      IB_CLIENT_ID: ${IB_CLIENT_ID:-11}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+      SCANNER_DB: /data/scanner_decisions.sqlite
+    volumes:
+      - scanner_data:/data            # append-only decision journal persists here
+    networks: [scannernet]
+
+networks:
+  scannernet:
+
+volumes:
+  scanner_data:
