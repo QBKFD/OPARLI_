@@ -42,6 +42,10 @@ TOL = 1.00                       # touch tolerance ($)
 WINDOW_MIN = 15                  # collapse alerts within the same 15-min bucket
 CF_HORIZONS = {"1h": 60, "4h": 240}   # counterfactual MFE/MAE horizons (minutes)
 MISSED_AFTER_H = 4               # auto-assign MISSED to alerts unanswered this long
+RECONNECT_BACKOFF_S = 20         # wait before exiting on a dropped gateway, so the
+                                 # container doesn't hammer-restart while the gateway
+                                 # is down for minutes (weekly 2FA window)
+SILENCE_WARN_S = 1800            # connected but no bars this long (market hours) -> Telegram warn
 
 
 # ── Level engine (from notebooks/backtest.ipynb, active_from construction) ──
@@ -454,6 +458,23 @@ def _load_recent_history(symbol: str, days: int, host: str, port: int, client_id
     return df[["open", "high", "low", "close"]].astype(float).sort_index()
 
 
+def _market_open(now) -> bool:
+    """Approximate XAUUSD (spot gold) trading window in UTC, used only to suppress
+    false 'no data' heartbeat warnings. Sun 22:00 -> Fri 21:00, minus the daily
+    21:00-22:00 maintenance break. Holidays aren't modelled — a rare spurious
+    warning is acceptable for a safety-net notification."""
+    wd, h = now.weekday(), now.hour     # Mon=0 .. Sun=6
+    if wd == 5:                          # Saturday
+        return False
+    if wd == 6:                          # Sunday: reopens 22:00 UTC
+        return h >= 22
+    if wd == 4 and h >= 21:              # Friday close
+        return False
+    if 21 <= h < 22:                     # daily maintenance break
+        return False
+    return True
+
+
 def run_live(symbol: str = "XAUUSD", dry: bool = False):
     """Live path: identical scanner code, fed by real IBKR bars.
 
@@ -487,9 +508,12 @@ def run_live(symbol: str = "XAUUSD", dry: bool = False):
 
     rebuild(pd.Timestamp.now(tz="UTC"))
 
+    hb = {"last": _time.time(), "warned": False}   # last final bar (wall clock)
+
     def on_bar(_sym, bar):
         if not bar.get("is_final"):
             return
+        hb["last"] = _time.time()
         ts = pd.Timestamp(bar["timestamp"]); ts = ts.tz_convert("UTC") if ts.tz else ts.tz_localize("UTC")
         o, h, l, c = bar["open"], bar["high"], bar["low"], bar["close"]
         with lock:
@@ -507,9 +531,18 @@ def run_live(symbol: str = "XAUUSD", dry: bool = False):
                         print(f"telegram send failed for {a['alert_id']}: {e}")
 
     tws = TWSConnector(host=host, port=port, client_id=client_id)
+    # Crash-only design: surface disconnects instead of relying on the connector's
+    # in-place reconnect, whose market-data resubscribe is a stub (a silent
+    # reconnect would leave us connected with NO bars). On any drop we back off
+    # and exit; Docker's restart policy + the entrypoint port-wait do a clean full
+    # reconnect + resubscribe via run_live's cold start. One code path to get
+    # right (cold start), not two.
+    tws.max_retries = 0
     tws.on_bar_update(on_bar)
     if not tws.connect():
-        raise RuntimeError("Could not connect to TWS/IB Gateway")
+        print("could not connect to gateway; backing off then exiting for restart", flush=True)
+        _time.sleep(RECONNECT_BACKOFF_S)
+        raise SystemExit(1)
     tws.subscribe_bars(symbol, exchange="SMART", sec_type="CMDTY", currency="USD")
     active = sum(1 for L in build_levels(state["hist"])
                  if L["active_from"] <= pd.Timestamp.now(tz="UTC") < L["active_to"])
@@ -520,6 +553,31 @@ def run_live(symbol: str = "XAUUSD", dry: bool = False):
     last_sweep = 0.0
     try:
         while True:
+            # Crash-only: a dropped gateway (daily restart / weekly 2FA) surfaces
+            # as not-connected. Back off, then exit so Docker restarts us into a
+            # clean full reconnect. The backoff stops a fast restart-loop while the
+            # gateway is down for minutes.
+            if not tws.connected:
+                print("gateway connection lost — backing off then exiting so Docker reconnects clean", flush=True)
+                try: tws.disconnect()
+                except Exception: pass
+                _time.sleep(RECONNECT_BACKOFF_S)
+                raise SystemExit(1)
+
+            # Heartbeat: connected but no bars for a while during market hours is a
+            # silent stall the self-heal won't catch -> warn once via Telegram.
+            now = pd.Timestamp.now(tz="UTC")
+            if not dry and _market_open(now) and _time.time() - hb["last"] > SILENCE_WARN_S:
+                if not hb["warned"]:
+                    try:
+                        tg.send(f"scanner: no XAUUSD bars for >{SILENCE_WARN_S // 60} min "
+                                f"during market hours — check the feed")
+                    except Exception:
+                        pass
+                    hb["warned"] = True
+            else:
+                hb["warned"] = False
+
             if dry:
                 _time.sleep(2)
                 continue
