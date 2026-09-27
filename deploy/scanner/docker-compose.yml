@@ -15,8 +15,12 @@ services:
       TRADING_MODE: ${TRADING_MODE:-paper}     # paper: same market data, no order risk
       READ_ONLY_API: ${READ_ONLY_API:-yes}     # scanner only reads — keep this yes
       TWOFA_TIMEOUT_ACTION: restart
-      AUTO_RESTART_TIME: ${AUTO_RESTART_TIME:-11:45 PM}
-      TIME_ZONE: ${TIME_ZONE:-Etc/UTC}
+      # Daily restart inside gold's 17:00-18:00 ET break. Scheduled in New York
+      # time because in UTC that break is 21-22 in summer but 22-23 in winter, so
+      # no fixed UTC time is always inside it. IBC reads the time from TZ.
+      AUTO_RESTART_TIME: ${AUTO_RESTART_TIME:-05:15 PM}
+      TIME_ZONE: ${TIME_ZONE:-America/New_York}
+      TZ: ${TIME_ZONE:-America/New_York}
       VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD:-}
     ports:
       # VNC bound to localhost only — SSH-tunnel in for the weekly 2FA login.
@@ -31,7 +35,9 @@ services:
     depends_on: [ibgateway]
     environment:
       IB_HOST: ibgateway
-      IB_PORT: ${IB_PORT:-4002}       # 4002 paper / 4001 live — match TRADING_MODE
+      # IB Gateway only accepts API clients from its own 127.0.0.1; the image's
+      # socat relay publishes it to other containers on 4004 (paper) / 4003 (live).
+      IB_PORT: ${IB_PORT:-4004}       # 4004 paper / 4003 live — match TRADING_MODE
       IB_CLIENT_ID: ${IB_CLIENT_ID:-11}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}

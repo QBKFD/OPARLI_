@@ -494,8 +494,15 @@ def run_live(symbol: str = "XAUUSD", dry: bool = False):
     con = open_log(check_same_thread=False)
     lock = threading.Lock()
 
-    # history first (separate short-lived connection, distinct clientId)
-    hist = _load_recent_history(symbol, days=10, host=host, port=port, client_id=client_id + 10)
+    # history first (separate short-lived connection, distinct clientId). A failure
+    # here takes the same crash-only path as a failed tws.connect(): back off, exit,
+    # let Docker restart us clean.
+    try:
+        hist = _load_recent_history(symbol, days=10, host=host, port=port, client_id=client_id + 10)
+    except Exception as e:
+        print(f"history load failed ({e!r}); backing off then exiting for restart", flush=True)
+        _time.sleep(RECONNECT_BACKOFF_S)
+        raise SystemExit(1)
     state = {"day": None, "scanner": None, "hist": hist}
 
     def rebuild(now):
