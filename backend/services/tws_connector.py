@@ -29,10 +29,13 @@ class TWSConnector:
     - Auto-reconnection with exponential backoff
     """
 
-    def __init__(self, host='127.0.0.1', port=7497, client_id=1):
+    def __init__(self, host='127.0.0.1', port=7497, client_id=1, readonly=False):
         self.host = host
         self.port = port
         self.client_id = client_id
+        # True for data-only clients of a Read-Only API gateway: skips ib_insync's
+        # order sync at connect (rejected with error 321 there, then times out)
+        self.readonly = readonly
 
         self.ib = IB()
         self.connected = False
@@ -68,7 +71,8 @@ class TWSConnector:
                     host=self.host,
                     port=self.port,
                     clientId=self.client_id,
-                    timeout=20
+                    timeout=20,
+                    readonly=self.readonly
                 )
             )
             self.connected = True

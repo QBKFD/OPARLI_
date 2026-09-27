@@ -138,7 +138,9 @@ class Scanner:
         self._active = []
         self._bucket_start = None
         self._bucket_touches: list[dict] = []
-        self._seq = 0
+        # per-day counter, so an alert's id depends only on that day's alerts, not
+        # on how far back the history (and a live warm-up) starts
+        self._seq = defaultdict(int)
 
     def on_bar(self, ts, o, h, l, c) -> list[dict]:
         finalized = []
@@ -189,9 +191,10 @@ class Scanner:
         alerts = []
         for cl in clusters:
             ts0 = min(t["ts"] for t in cl)
-            self._seq += 1
+            day = ts0.strftime("%Y%m%d")
+            self._seq[day] += 1
             alerts.append(dict(
-                alert_id=f"A{ts0.strftime('%Y%m%d')}-{self._seq:03d}",
+                alert_id=f"A{day}-{self._seq[day]:03d}",
                 alert_ts_utc=ts0.strftime("%Y-%m-%d %H:%M:%S"),
                 level_types=",".join(sorted({t["type"] for t in cl})),
                 level_price=round(sum(t["value"] for t in cl) / len(cl), 3),
@@ -200,6 +203,39 @@ class Scanner:
                 confluence_count=len({t["type"] for t in cl}),
             ))
         return alerts
+
+
+class LiveLevels:
+    """Keeps a live Scanner equal to a continuous replay over the same bars.
+
+    build_levels() only knows a level once its source period has bars, so a level
+    list built at one moment lacks — or holds partial values for — the session H/L
+    that close later. So rebuild at every point where new levels become active
+    (UTC midnight and each session close), then warm the fresh Scanner on ALL
+    history before the current bar WITHOUT emitting. That skips alerts for touches
+    that happened before we came online, and keeps first-touch state for levels
+    carried over from yesterday, exactly as a continuous replay would hold it."""
+
+    def __init__(self, hist: pd.DataFrame, now):
+        self.hist = hist
+        self._rebuild(now)
+
+    @staticmethod
+    def _epoch(ts):
+        # changes exactly when new levels can activate: midnight, session closes
+        return ts.normalize(), sum(ts.hour >= h1 for _, h1 in SESSIONS.values())
+
+    def _rebuild(self, now):
+        self.epoch = self._epoch(now)
+        self.scanner = Scanner(build_levels(self.hist))
+        for ts, o, h, l, c in self.hist[self.hist.index < now].itertuples(name=None):
+            self.scanner.on_bar(ts, o, h, l, c)
+
+    def on_bar(self, ts, o, h, l, c) -> list[dict]:
+        self.hist.loc[ts] = [o, h, l, c]
+        if self._epoch(ts) != self.epoch:
+            self._rebuild(ts)
+        return self.scanner.on_bar(ts, o, h, l, c)
 
 
 # ── Counterfactual: forward MFE/MAE at 1h/4h (direction-agnostic) ──────────
@@ -443,7 +479,7 @@ def _load_recent_history(symbol: str, days: int, host: str, port: int, client_id
     that stops at the last backfill and would leave the scanner with no levels."""
     from ib_insync import IB, Contract
     ib = IB()
-    ib.connect(host, port, clientId=client_id, timeout=10)
+    ib.connect(host, port, clientId=client_id, timeout=10, readonly=True)
     try:
         c = ib.qualifyContracts(Contract(symbol=symbol, secType="CMDTY", exchange="SMART", currency="USD"))[0]
         bars = ib.reqHistoricalData(c, endDateTime="", durationStr=f"{days} D",
@@ -505,17 +541,7 @@ def run_live(symbol: str = "XAUUSD", dry: bool = False):
         print(f"history load failed ({e!r}); backing off then exiting for restart", flush=True)
         _time.sleep(RECONNECT_BACKOFF_S)
         raise SystemExit(1)
-    state = {"day": None, "scanner": None, "hist": hist}
-
-    def rebuild(now):
-        state["day"] = now.normalize()
-        state["scanner"] = Scanner(build_levels(state["hist"]))
-        # warm scanner state on today's bars-so-far WITHOUT emitting (so we don't
-        # blast alerts for levels price already visited before we came online)
-        for ts, o, h, l, c in state["hist"].loc[state["day"]:now].itertuples(name=None):
-            state["scanner"].on_bar(ts, o, h, l, c)
-
-    rebuild(pd.Timestamp.now(tz="UTC"))
+    live = LiveLevels(hist, pd.Timestamp.now(tz="UTC"))
 
     hb = {"last": _time.time(), "warned": False}   # last final bar (wall clock)
 
@@ -526,10 +552,7 @@ def run_live(symbol: str = "XAUUSD", dry: bool = False):
         ts = pd.Timestamp(bar["timestamp"]); ts = ts.tz_convert("UTC") if ts.tz else ts.tz_localize("UTC")
         o, h, l, c = bar["open"], bar["high"], bar["low"], bar["close"]
         with lock:
-            state["hist"].loc[ts] = [o, h, l, c]
-            if ts.normalize() != state["day"]:
-                rebuild(ts)
-            for a in state["scanner"].on_bar(ts, o, h, l, c):
+            for a in live.on_bar(ts, o, h, l, c):
                 insert_alert(con, a); con.commit()
                 if dry:
                     print("ALERT  " + format_alert(a).replace("\n", " | "), flush=True)
@@ -539,7 +562,7 @@ def run_live(symbol: str = "XAUUSD", dry: bool = False):
                     except Exception as e:  # a send failure must not kill the feed
                         print(f"telegram send failed for {a['alert_id']}: {e}")
 
-    tws = TWSConnector(host=host, port=port, client_id=client_id)
+    tws = TWSConnector(host=host, port=port, client_id=client_id, readonly=True)
     # Crash-only design: surface disconnects instead of relying on the connector's
     # in-place reconnect, whose market-data resubscribe is a stub (a silent
     # reconnect would leave us connected with NO bars). On any drop we back off
@@ -553,7 +576,7 @@ def run_live(symbol: str = "XAUUSD", dry: bool = False):
         _time.sleep(RECONNECT_BACKOFF_S)
         raise SystemExit(1)
     tws.subscribe_bars(symbol, exchange="SMART", sec_type="CMDTY", currency="USD")
-    active = sum(1 for L in build_levels(state["hist"])
+    active = sum(1 for L in build_levels(live.hist)
                  if L["active_from"] <= pd.Timestamp.now(tz="UTC") < L["active_to"])
     mode = "DRY (terminal)" if dry else "LIVE (Telegram)"
     print(f"{mode}: scanning {symbol}, {active} levels active. Ctrl-C to stop.", flush=True)
@@ -614,7 +637,7 @@ def run_live(symbol: str = "XAUUSD", dry: bool = False):
                     sweep_auto_missed(con, now)
                     # counterfactuals need the future bars, so fill from the
                     # accumulated live frame once each alert's 4h window elapses
-                    sweep_counterfactuals(con, state["hist"].sort_index(), now)
+                    sweep_counterfactuals(con, live.hist.sort_index(), now)
                 last_sweep = _time.time()
     except KeyboardInterrupt:
         print("\nstopping."); tws.disconnect()
@@ -719,6 +742,22 @@ def selftest():
     got = {t: _market_open(pd.Timestamp(t, tz="UTC")) for t in want}
     if got != want:
         fails.append(f"market hours/DST: {[t for t in want if got[t] != want[t]]}")
+    # 10) live == continuous replay: from the moment it comes online, LiveLevels
+    #     must emit exactly what one Scanner over the same bars emits — across
+    #     session closes, a UTC midnight and a weekend reopen
+    win = df[(df.index >= pd.Timestamp("2024-03-07", tz="UTC")) & (df.index < pd.Timestamp("2024-03-13", tz="UTC"))]
+    t0 = pd.Timestamp("2024-03-08 10:37", tz="UTC")
+    sc, rep = Scanner(build_levels(win)), []
+    for ts, o, h, l, c in win.itertuples(name=None):
+        out = sc.on_bar(ts, o, h, l, c)
+        if ts >= t0:
+            rep += out
+    live, got = LiveLevels(win[win.index < t0].copy(), t0), []
+    for ts, o, h, l, c in win[win.index >= t0].itertuples(name=None):
+        got += live.on_bar(ts, o, h, l, c)
+    if not rep or got != rep:
+        fails.append(f"live vs replay: {len(got)} live vs {len(rep)} replay alerts, "
+                     f"{sum(a != b for a, b in zip(got, rep))} differ")
 
     print("SELFTEST:", "ALL PASSED" if not fails else f"FAILED {fails}")
     return not fails
