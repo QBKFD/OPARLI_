@@ -2,7 +2,9 @@
 # Only needs ib_insync + pandas + the two source files (no DB, no psycopg2).
 FROM python:3.12-slim
 
-RUN pip install --no-cache-dir ib_insync==0.9.86 "pandas>=2.0" "numpy>=1.24" pyarrow
+# tzdata: the heartbeat's market hours are in America/New_York, and the slim
+# image may ship no system zoneinfo for Python to fall back on.
+RUN pip install --no-cache-dir ib_insync==0.9.86 "pandas>=2.0" "numpy>=1.24" pyarrow tzdata
 
 WORKDIR /app
 # services/ is a package with only tws_connector (imports ib_insync + stdlib)

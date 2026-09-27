@@ -459,18 +459,20 @@ def _load_recent_history(symbol: str, days: int, host: str, port: int, client_id
 
 
 def _market_open(now) -> bool:
-    """Approximate XAUUSD (spot gold) trading window in UTC, used only to suppress
-    false 'no data' heartbeat warnings. Sun 22:00 -> Fri 21:00, minus the daily
-    21:00-22:00 maintenance break. Holidays aren't modelled — a rare spurious
-    warning is acceptable for a safety-net notification."""
-    wd, h = now.weekday(), now.hour     # Mon=0 .. Sun=6
+    """Approximate XAUUSD (spot gold) trading window, used only to suppress false
+    'no data' heartbeat warnings. Sun 18:00 -> Fri 17:00 New York time, minus the
+    daily 17:00-18:00 break. Evaluated in New York time because the break moves in
+    UTC with US DST (21-22 UTC in summer, 22-23 UTC in winter). Holidays aren't
+    modelled — a rare spurious warning is acceptable for a safety-net notification."""
+    et = now.tz_convert("America/New_York")
+    wd, h = et.weekday(), et.hour       # Mon=0 .. Sun=6
     if wd == 5:                          # Saturday
         return False
-    if wd == 6:                          # Sunday: reopens 22:00 UTC
-        return h >= 22
-    if wd == 4 and h >= 21:              # Friday close
+    if wd == 6:                          # Sunday: reopens 18:00 ET
+        return h >= 18
+    if wd == 4 and h >= 17:              # Friday close
         return False
-    if 21 <= h < 22:                     # daily maintenance break
+    if h == 17:                          # daily maintenance break
         return False
     return True
 
@@ -574,6 +576,10 @@ def run_live(symbol: str = "XAUUSD", dry: bool = False):
             # Heartbeat: connected but no bars for a while during market hours is a
             # silent stall the self-heal won't catch -> warn once via Telegram.
             now = pd.Timestamp.now(tz="UTC")
+            if not _market_open(now):
+                # silence only counts while the market is open, so the first
+                # minutes after a reopen don't read as a 30-min stall
+                hb["last"] = _time.time()
             if not dry and _market_open(now) and _time.time() - hb["last"] > SILENCE_WARN_S:
                 if not hb["warned"]:
                     try:
@@ -704,6 +710,15 @@ def selftest():
                con.execute("SELECT alert_id, mfe_up_4h, mfe_dn_4h FROM counterfactuals").fetchall())
     if not (cfs.get("A_cf") == (10.0, 5.0) and "A_new" not in cfs):
         fails.append(f"counterfactual sweep: cfs={cfs}")
+
+    # 9) heartbeat market hours follow New York time, so the break is right both
+    #    sides of US DST (21-22 UTC in summer, 22-23 UTC in winter)
+    want = {"2026-07-14 21:30": False, "2026-07-14 22:30": True,    # summer Tue: break, reopened
+            "2026-01-13 21:30": True, "2026-01-13 22:30": False,    # winter Tue: open, break
+            "2026-01-11 22:30": False, "2026-01-11 23:30": True}    # winter Sun: before/after open
+    got = {t: _market_open(pd.Timestamp(t, tz="UTC")) for t in want}
+    if got != want:
+        fails.append(f"market hours/DST: {[t for t in want if got[t] != want[t]]}")
 
     print("SELFTEST:", "ALL PASSED" if not fails else f"FAILED {fails}")
     return not fails
