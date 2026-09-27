@@ -4,7 +4,9 @@ FROM python:3.12-slim
 
 # tzdata: the heartbeat's market hours are in America/New_York, and the slim
 # image may ship no system zoneinfo for Python to fall back on.
-RUN pip install --no-cache-dir ib_insync==0.9.86 "pandas>=2.0" "numpy>=1.24" pyarrow tzdata
+# pandas/numpy pinned to the versions the selftest and dry-live runs used, so the
+# container runs the scanner exactly as validated (an unpinned build got pandas 3).
+RUN pip install --no-cache-dir ib_insync==0.9.86 pandas==2.3.3 numpy==2.2.6 pyarrow tzdata
 
 WORKDIR /app
 # services/ is a package with only tws_connector (imports ib_insync + stdlib)
