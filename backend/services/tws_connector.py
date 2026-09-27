@@ -378,11 +378,16 @@ class TWSConnector:
 
                 # For commodities, use bid/ask midpoint if available, otherwise use close
                 # This ensures we get live prices instead of stale close prices
+                # IBKR sends -1 (or 0) for "no quote", e.g. while a data farm
+                # reconnects; a -1 must never become a price in a bar.
+                def _px(x):
+                    return x is not None and x == x and x > 0
+
                 price = None
-                if ticker.bid and ticker.ask and ticker.bid == ticker.bid and ticker.ask == ticker.ask:
+                if _px(ticker.bid) and _px(ticker.ask):
                     # Use midpoint of bid/ask for live price
                     price = (float(ticker.bid) + float(ticker.ask)) / 2.0
-                elif ticker.close and ticker.close == ticker.close:
+                elif _px(ticker.close):
                     # Fallback to close price
                     price = float(ticker.close)
 

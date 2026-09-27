@@ -513,6 +513,15 @@ def _market_open(now) -> bool:
     return True
 
 
+def _valid_bar(ts, o, h, l, c) -> bool:
+    """Only real prices inside trading hours may reach the level engine. IBKR sends
+    -1 for "no quote" (e.g. while a data farm reconnects) and pushes frozen quotes
+    while the market is closed; either becomes a fake touch or a fake session.
+    The backtest data has neither: all its bars fall inside _market_open() and
+    every price is positive."""
+    return _market_open(ts) and all(x == x and x > 0 for x in (o, h, l, c)) and l <= h
+
+
 def run_live(symbol: str = "XAUUSD", dry: bool = False):
     """Live path: identical scanner code, fed by real IBKR bars.
 
@@ -541,6 +550,7 @@ def run_live(symbol: str = "XAUUSD", dry: bool = False):
         print(f"history load failed ({e!r}); backing off then exiting for restart", flush=True)
         _time.sleep(RECONNECT_BACKOFF_S)
         raise SystemExit(1)
+    hist = hist[[_valid_bar(*r) for r in hist.itertuples(name=None)]]
     live = LiveLevels(hist, pd.Timestamp.now(tz="UTC"))
 
     hb = {"last": _time.time(), "warned": False}   # last final bar (wall clock)
@@ -548,9 +558,11 @@ def run_live(symbol: str = "XAUUSD", dry: bool = False):
     def on_bar(_sym, bar):
         if not bar.get("is_final"):
             return
-        hb["last"] = _time.time()
         ts = pd.Timestamp(bar["timestamp"]); ts = ts.tz_convert("UTC") if ts.tz else ts.tz_localize("UTC")
         o, h, l, c = bar["open"], bar["high"], bar["low"], bar["close"]
+        if not _valid_bar(ts, o, h, l, c):
+            return
+        hb["last"] = _time.time()
         with lock:
             for a in live.on_bar(ts, o, h, l, c):
                 insert_alert(con, a); con.commit()
@@ -758,6 +770,18 @@ def selftest():
     if not rep or got != rep:
         fails.append(f"live vs replay: {len(got)} live vs {len(rep)} replay alerts, "
                      f"{sum(a != b for a, b in zip(got, rep))} differ")
+    # 11) live bar filter: IBKR's -1 "no quote", NaN, and frozen quotes outside
+    #     trading hours never reach the level engine; a normal bar does
+    nan = float("nan")
+    bars = {"2026-09-28 10:00": (4280, 4281, 4279, 4280.5),     # Mon, London: real
+            "2026-09-28 10:01": (4280, 4281, -1.0, -1.0),       # -1 "no quote"
+            "2026-09-28 10:02": (4280, nan, 4279, 4280),        # NaN
+            "2026-09-27 18:07": (4285, 4285, 4285, 4285),       # Sun before the reopen
+            "2026-07-14 21:30": (4280, 4281, 4279, 4280)}       # summer daily break
+    ok = {t: _valid_bar(pd.Timestamp(t, tz="UTC"), *v) for t, v in bars.items()}
+    if ok != {"2026-09-28 10:00": True, "2026-09-28 10:01": False, "2026-09-28 10:02": False,
+              "2026-09-27 18:07": False, "2026-07-14 21:30": False}:
+        fails.append(f"live bar filter: {ok}")
 
     print("SELFTEST:", "ALL PASSED" if not fails else f"FAILED {fails}")
     return not fails
